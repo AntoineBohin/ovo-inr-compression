@@ -1,36 +1,24 @@
 import os
-import csv
-import shutil
-import copy
-import glob
 import json
-import os
 from collections import OrderedDict
-from functools import partial
-
-from torch import nn
-
-
-import torch
-import yaml
-from torch.utils.data import DataLoader
 import re
-import torchvision.transforms as transforms
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 
-#import modules
+# Import modules
 import training_utils
 
 import csv
 import math
 
 import matplotlib.colors as colors
-import numpy as np
 import scipy.ndimage
 import scipy.special
-import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 
 
 ######################################### META LEARNING MODULES #############################################
@@ -41,13 +29,14 @@ class MetaModule(nn.Module):
     """
     Base class for PyTorch meta-learning modules.
     """
-    def meta_named_parameters(self, prefix='', recurse=True):
+    def meta_named_parameters(self, prefix: str = '', recurse: bool = True):
         """Return named parameters for meta-learning."""
         gen = self._named_members(lambda module: module._parameters.items() if isinstance(module, MetaModule) else [], prefix=prefix, recurse=recurse)
         for elem in gen:
             yield elem
 
-    def meta_parameters(self, recurse=True):
+    def meta_parameters(self, recurse: bool = True):
+        """Yield meta-learning parameters."""
         for name, param in self.meta_named_parameters(recurse=recurse):
             yield param
 
@@ -57,7 +46,8 @@ class MetaSequential(nn.Sequential, MetaModule):
     """
     __doc__ = nn.Sequential.__doc__
 
-    def forward(self, input, params=None):
+    def forward(self, input: torch.Tensor, params: OrderedDict = None) -> torch.Tensor:
+        """Forward pass through the sequential container."""
         for name, module in self._modules.items():
             if isinstance(module, MetaModule):
                 input = module(input, params=get_subdict(params, name))
@@ -72,11 +62,11 @@ class MetaSequential(nn.Sequential, MetaModule):
 class MAML(nn.Module):
     '''MAML module from https://github.com/vsitzmann/metasdf'''
 
-    def __init__(self, num_meta_steps, hypo_module, loss, init_lr,
-                first_order=False, l1_lambda=0):
+    def __init__(self, num_meta_steps: int, hypo_module: MetaModule, loss: nn.Module, init_lr: float,
+                first_order: bool = False, l1_lambda: float = 0):
         super().__init__()
 
-        self.hypo_module = hypo_module  # The module who's weights we want to meta-learn.
+        self.hypo_module = hypo_module  # The module whose weights we want to meta-learn.
         self.first_order = first_order
         self.loss = loss
         self.log = []
@@ -93,8 +83,8 @@ class MAML(nn.Module):
             param_count += np.prod(param.shape)
         print(param_count)
 
-    def _update_step(self, loss, param_dict, step):
-        """Inner Loop Update Step: gradient descent on a specific task"""
+    def _update_step(self, loss: torch.Tensor, param_dict: OrderedDict, step: int) -> tuple:
+        """Inner Loop Update Step: gradient descent on a specific task."""
         grads = torch.autograd.grad(loss, param_dict.values(), create_graph=False if self.first_order else True)
         params = OrderedDict()
         for i, ((name, param), grad) in enumerate(zip(param_dict.items(), grads)):
@@ -102,11 +92,12 @@ class MAML(nn.Module):
             params[name] = param - lr * grad
         return params, grads
 
-    def forward_with_params(self, query_x, fast_params, **kwargs):
+    def forward_with_params(self, query_x: torch.Tensor, fast_params: OrderedDict, **kwargs) -> torch.Tensor:
+        """Forward pass with given parameters."""
         output = self.hypo_module({'coords': query_x}, params=fast_params)
         return output
 
-    def generate_params(self, context_dict):
+    def generate_params(self, context_dict: dict) -> tuple:
         """Adapt the model using the context set with input 'x' and target 'y'."""
         x = context_dict.get('x').cuda()
         y = context_dict.get('y').cuda()
@@ -138,8 +129,9 @@ class MAML(nn.Module):
 
         return fast_params, intermed_predictions
 
-    def forward(self, meta_batch, **kwargs):
-        # The meta_batch conists of the "context" set (the observations we're conditioning on)
+    def forward(self, meta_batch: dict, **kwargs) -> dict:
+        """Forward pass for the meta-batch."""
+        # The meta_batch consists of the "context" set (the observations we're conditioning on)
         # and the "query" inputs (the points where we want to evaluate the specialized model)
         context = meta_batch['context']
         query_x = meta_batch['query']['x'].cuda()
@@ -161,7 +153,8 @@ class BatchLinear(nn.Linear, MetaModule):
     """
     __doc__ = nn.Linear.__doc__
 
-    def forward(self, input, params=None):
+    def forward(self, input: torch.Tensor, params: OrderedDict = None) -> torch.Tensor:
+        """Forward pass through the linear layer."""
         # If no parameters are provided, use the layer's own weights and biases
         if params is None:
             params = OrderedDict(self.named_parameters())
@@ -183,8 +176,8 @@ class INRNet(MetaModule):
     This class maps input coordinates to output features using positional encoding and a fully connected neural network.
     '''
 
-    def __init__(self, out_features=1, type='sine', in_features=2,
-                  hidden_features=256, num_hidden_layers=3, ff_dims=None, **kwargs):
+    def __init__(self, out_features: int = 1, type: str = 'sine', in_features: int = 2,
+                  hidden_features: int = 256, num_hidden_layers: int = 3, ff_dims: int = None, **kwargs):
         super().__init__()
 
         # Initialize positional encoding (Based on NeRF - source [40] in the article)
@@ -202,7 +195,8 @@ class INRNet(MetaModule):
         self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
                            hidden_features=hidden_features, outermost_linear=True)
 
-    def forward(self, model_input, params=None):
+    def forward(self, model_input: dict, params: OrderedDict = None) -> dict:
+        """Forward pass through the INR network."""
         if params is None:
             params = OrderedDict(self.named_parameters())
 
@@ -215,11 +209,11 @@ class INRNet(MetaModule):
         output = self.net(coords, get_subdict(params, 'net'))
         return {'model_in': coords_org, 'model_out': output}
 
-    def predict(self, model_input):
+    def predict(self, model_input: dict) -> dict:
         """Alias for the forward method, for convenience."""
         return self.forward(model_input)
 
-    def forward_with_activations(self, model_input):
+    def forward_with_activations(self, model_input: dict) -> dict:
         '''Returns not only model output, but also intermediate activations.'''
         coords = model_input['coords'].clone().detach().requires_grad_(True)
         activations = self.net.forward_with_activations(coords)
@@ -231,8 +225,8 @@ class FCBlock(MetaModule):
     Fully connected neural network with support for meta-learning (weights swapping).
     """
 
-    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, weight_init=None):
+    def __init__(self, in_features: int, out_features: int, num_hidden_layers: int, hidden_features: int,
+                 outermost_linear: bool = False, weight_init: callable = None):
         super().__init__()
 
         self.first_layer_init = None
@@ -266,13 +260,14 @@ class FCBlock(MetaModule):
         # Special initialization for the first layer
         self.net[0].apply(first_layer_init)
 
-    def forward(self, coords, params=None, **kwargs):
+    def forward(self, coords: torch.Tensor, params: OrderedDict = None, **kwargs) -> torch.Tensor:
+        """Forward pass through the fully connected block."""
         if params is None:
             params = OrderedDict(self.named_parameters())
         output = self.net(coords, params=get_subdict(params, 'net'))
         return output
 
-    def forward_with_activations(self, coords, params=None, retain_grad=False):
+    def forward_with_activations(self, coords: torch.Tensor, params: OrderedDict = None, retain_grad: bool = False) -> OrderedDict:
         '''Returns not only model output, but also intermediate activations.'''
         if params is None:
             params = OrderedDict(self.named_parameters())
@@ -315,7 +310,7 @@ class PosEncodingNeRF(nn.Module):
         scale (float, optional): Scaling factor for the frequencies.
     """
 
-    def __init__(self, in_features, sidelength=None, fn_samples=None, use_nyquist=True, num_frequencies=None, scale=2):
+    def __init__(self, in_features: int, sidelength: int = None, fn_samples: int = None, use_nyquist: bool = True, num_frequencies: int = None, scale: float = 2):
         super().__init__()
         self.in_features = in_features # Number of input features (1, 2, or 3)
         self.scale = scale  # Scaling factor for frequency bands
@@ -341,11 +336,13 @@ class PosEncodingNeRF(nn.Module):
             self.num_frequencies = num_frequencies
         self.out_dim = in_features + in_features * 2 * self.num_frequencies  
 
-    def get_num_frequencies_nyquist(self, samples):
+    def get_num_frequencies_nyquist(self, samples: int) -> int:
+        """Calculate the number of frequencies based on the Nyquist rate."""
         nyquist_rate = 1 / (2 * (2 * 1 / samples))
         return int(math.floor(math.log(nyquist_rate, 2)))
 
-    def forward(self, coords):
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """Apply positional encoding to the input coordinates."""
         coords_pos_enc = coords
         for i in range(self.num_frequencies):
             for j in range(self.in_features):
@@ -364,10 +361,11 @@ class Sine(nn.Module):
     """
     def __init__(self):
         super().__init__()
-    def forward(self, input):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Apply sine activation to the input."""
         return torch.sin(30 * input)
 
-def sine_init(m):
+def sine_init(m: nn.Module):
     """
     Initializes the weights of a layer using a uniform distribution for the SIREN model.
     The range is determined by the number of input features and scaled by 1/30.
@@ -378,7 +376,8 @@ def sine_init(m):
             num_input = m.weight.size(-1)
             m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)
 
-def first_layer_sine_init(m):
+def first_layer_sine_init(m: nn.Module):
+    """Special initialization for the first layer of the SIREN model."""
     with torch.no_grad():
         if hasattr(m, 'weight'):
             num_input = m.weight.size(-1)
@@ -386,7 +385,7 @@ def first_layer_sine_init(m):
 
 ############################################## UTILS ##############################################
 
-def get_subdict(dictionary, key=None):
+def get_subdict(dictionary: OrderedDict, key: str = None) -> OrderedDict:
     """
     Extracts a subset of a dictionary whose keys start with a given prefix.
 
@@ -406,12 +405,12 @@ def get_subdict(dictionary, key=None):
 
 ########################## UTILS FUNCTIONS #########################
 
-def model_l1_dictdiff(ref_model_dict, model_dict, l1_lambda):
-    "Computes the L1 norm of the difference between the parameters of two model state dictionaries. Used to regulaize models during training."
+def model_l1_dictdiff(ref_model_dict: OrderedDict, model_dict: OrderedDict, l1_lambda: float) -> dict:
+    """Computes the L1 norm of the difference between the parameters of two model state dictionaries. Used to regularize models during training."""
     l1_norm = sum((p.squeeze() - ref_p.squeeze()).abs().sum() for (p, ref_p) in zip(ref_model_dict.values(), model_dict.values()))
     return {'l1_loss': l1_lambda * l1_norm}
 
-def model_l1(model, l1_lambda):
-    "Computes the L1 norm of the models parameters and weights it with l1_lambda"
+def model_l1(model: nn.Module, l1_lambda: float) -> dict:
+    """Computes the L1 norm of the model's parameters and weights it with l1_lambda."""
     l1_norm = sum(p.abs().sum() for p in model.parameters())
     return {'l1_loss': l1_lambda * l1_norm}
